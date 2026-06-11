@@ -1,5 +1,7 @@
 'what i can not create, i do not understand'
 
+https://build-your-own.org/redis/06_event_loop_impl
+
 redis -> remote dictionary server
 
 what is redis?
