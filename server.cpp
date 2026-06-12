@@ -1,5 +1,6 @@
 #include <asm-generic/socket.h>
 #include <assert.h>
+#include <cerrno>
 #include <cstddef>
 #include <errno.h>
 #include <stdint.h>
@@ -18,6 +19,13 @@
 
 #define MAX_BUF_SIZE 64 * 1024
 
+// forward declarations
+struct Conn;
+void handle_read(Conn* conn);
+void handle_write(Conn* conn);
+
+
+
 void die(const char* err_str) {
     fprintf(stderr, "%s\n", err_str);
     exit(EXIT_FAILURE);
@@ -29,6 +37,7 @@ static void set_fd_nonblock(int fd) {
     fcntl(fd, F_SETFL, flags);
 }
 
+// TODO: pick a better data structure since appending is fine but erase is not
 void buf_append(std::vector<uint8_t>& buf, const uint8_t* data, size_t n) {
    buf.insert(buf.end(), data, data + n);
 }
@@ -123,7 +132,7 @@ static bool try_parse_request(Conn* conn){
     return true;
 }
 
-static void handle_read(Conn* conn) {
+void handle_read(Conn* conn) {
     // non blocking read
     uint8_t buf[MAX_BUF_SIZE];
     ssize_t count = read(conn->fd, buf, sizeof(buf));
@@ -143,15 +152,19 @@ static void handle_read(Conn* conn) {
     if(conn->outgoing.size() > 0) {
         conn->want_write = true;
         conn->want_read  = false;
+        return handle_write(conn);
     }
 }
 
-static void handle_write(Conn* conn) {
+void handle_write(Conn* conn) {
     assert(conn->outgoing.size() > 0);
     ssize_t count = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if(count < 0 && errno == EAGAIN) {
+        return; // actually not ready yet
+    }
     if(count < 0) {
         conn->want_close = true;
-        return;
+        return; // error
     }
 
     buf_consume(conn->outgoing,(size_t)count);
