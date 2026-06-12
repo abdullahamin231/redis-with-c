@@ -1,4 +1,5 @@
 #include <asm-generic/socket.h>
+#include <string>
 #include <assert.h>
 #include <cerrno>
 #include <cstddef>
@@ -18,17 +19,19 @@
 #include <poll.h>
 
 #define MAX_BUF_SIZE 64 * 1024
+#define MAX_ARGS 8
 
 // forward declarations
 struct Conn;
 void handle_read(Conn* conn);
 void handle_write(Conn* conn);
 
-
-
 void die(const char* err_str) {
     fprintf(stderr, "%s\n", err_str);
     exit(EXIT_FAILURE);
+}
+void msg(const char* msg){
+    fprintf(stderr, "%s\n", msg);
 }
 
 static void set_fd_nonblock(int fd) {
@@ -45,6 +48,22 @@ void buf_append(std::vector<uint8_t>& buf, const uint8_t* data, size_t n) {
 void buf_consume(std::vector<uint8_t>& buf,size_t n) {
    buf.erase(buf.begin(), buf.begin() + n);
 }
+
+// int* &p = reference to int* just so we can increment the value
+bool read_u32(const uint8_t* &start, const uint8_t* end, uint32_t& out) {
+    if(start + 4 > end) return false;
+    memcpy(&out, start, 4);
+    start += 4;
+    return true;
+}
+
+bool read_str(const uint8_t*& start, const uint8_t* end, uint32_t len, std::string& out) {
+    if(start + len > end) return false;
+    out.assign(start, start + len);
+    start += len;
+    return true;
+}
+
 
 
 struct Conn {
@@ -88,7 +107,6 @@ struct Conn {
  *          data = pending_data(fd) # data to write produced by application
  *          write_nb(fd, data) # non blocking - append to buffer
  */
-
 static Conn* handle_accept(int fd) {
     struct sockaddr_in client_addr = {};
     socklen_t len = sizeof(client_addr);
@@ -103,11 +121,32 @@ static Conn* handle_accept(int fd) {
     conn->want_read = true; // wait for first request
     return conn;
 }
+
+bool parse_request(const uint8_t* request, uint32_t len, std::vector<std::string>& out) {
+    const uint8_t* start = request;
+    const uint8_t* end   = request + len;
+
+    uint32_t nargs = 0;
+    if(read_u32(start, end, nargs) == false) return false;
+    if(nargs > MAX_ARGS) return false;
+
+    // 23GET3KEY
+    while(out.size() < nargs) {
+        uint32_t arg_len = 0;
+        if(read_u32(start, end, arg_len) == false) return false;
+        out.push_back(std::string());
+        if(read_str(start, end, arg_len, out.back()) == false) return false;
+    }
+    if(start != end) return false; // had garbage
+    return true;
+}
+
 // The handling is split into try_one_request(). If there is not enough data, it will do nothing until a future loop iteration with more data.
 // TCP is a byte stream, so a single read() may contain a partial request
 // or multiple requests. We first accumulate bytes into the input buffer,
 // then try to parse complete requests. If a request is incomplete, we
 // return and wait for the next poll() event instead of blocking.
+// request protocol: [len][data of len bytes][len][data of len bytes]
 static bool try_parse_request(Conn* conn){
     if(conn->incoming.size() < 4) return false;
 
@@ -122,9 +161,19 @@ static bool try_parse_request(Conn* conn){
 
     const uint8_t* request = &conn->incoming[4];
 
-    /* PROCESS REQUEST */
-    buf_append(conn->outgoing, (const uint8_t*)&len, 4);
-    buf_append(conn->outgoing, request, len);
+    // request protocol:
+    // [nargs][len1][arg1][len2][arg2]...[lenn][argn]
+    // [21GET8abdullah][]
+    std::vector<std::string> cmds;
+    if(parse_request(request, len, cmds) == false) {
+        conn->want_close = true;
+        return false;
+    }
+
+    printf("cmd: ");
+    for(const auto& cmd : cmds) printf("%s ", cmd.c_str());
+    printf("\n");
+
 
     // remove the message from incoming
     buf_consume(conn->incoming, len + 4);
@@ -136,7 +185,14 @@ void handle_read(Conn* conn) {
     // non blocking read
     uint8_t buf[MAX_BUF_SIZE];
     ssize_t count = read(conn->fd, buf, sizeof(buf));
-    if(count <= 0) {
+    if(count < 0 && errno == EAGAIN) return;
+    if(count < 0) {
+        conn->want_close = true;
+        return;
+    }
+    if(count == 0){
+        if(conn->incoming.size() == 0) msg("client closed");
+        else msg("unexpected EOF");
         conn->want_close = true;
         return;
     }
