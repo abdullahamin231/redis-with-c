@@ -1,5 +1,6 @@
 #include <asm-generic/socket.h>
 #include <assert.h>
+#include <cstddef>
 #include <errno.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -11,9 +12,9 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <vector>
 #include <poll.h>
-#include <iostream>
 
 #define MAX_BUF_SIZE 64 * 1024
 
@@ -36,19 +37,6 @@ void buf_consume(std::vector<uint8_t>& buf,size_t n) {
    buf.erase(buf.begin(), buf.begin() + n);
 }
 
-
-/**
- * while running:
- *      want_read  = [...]
- *      want_write = [...]
- *      can_read, can_write = wait_for_readiness(want_read, want_write) # blocks until there is one r/w conn.
- *      for fd in can_read:
- *          data = read_nb(fd) # non blocking
- *          handle_data(fd, data) # application logic w/o IO
- *      for fd in can_write:
- *          data = pending_data(fd) # data to write produced by application
- *          write_nb(fd, data) # non blocking - append to buffer
- */
 
 struct Conn {
     int fd          = -1;
@@ -76,147 +64,158 @@ struct Conn {
      */
 };
 
+/**
+ * 1. create socket
+ * 2. bind socket to port
+ * 3. listen
+ * while running:
+ *      want_read  = [...]
+ *      want_write = [...]
+ *      can_read, can_write = wait_for_readiness(want_read, want_write) # blocks until there is one r/w conn.
+ *      for fd in can_read:
+ *          data = read_nb(fd) # non blocking
+ *          handle_data(fd, data) # application logic w/o IO
+ *      for fd in can_write:
+ *          data = pending_data(fd) # data to write produced by application
+ *          write_nb(fd, data) # non blocking - append to buffer
+ */
 
 static Conn* handle_accept(int fd) {
     struct sockaddr_in client_addr = {};
-    socklen_t addr_len = sizeof(client_addr);
-    int conn_fd =  accept(fd, (struct sockaddr *) &client_addr, &addr_len);
-    if(conn_fd < 0) {
-        return NULL;
-    }
+    socklen_t len = sizeof(client_addr);
+    int conn_fd = accept(fd, (struct sockaddr *)&client_addr, &len);
+    if(conn_fd < 0) return NULL;
 
     set_fd_nonblock(conn_fd);
+    printf("accepted connection from %s:%d\n", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
 
-    Conn* conn = new Conn;
+    Conn* conn = new Conn();
     conn->fd = conn_fd;
-    conn->want_read = true; // ready for 1st request
+    conn->want_read = true; // wait for first request
     return conn;
 }
-
-// process 1 request if there is enough data
-bool try_one_request(Conn* conn) {
-    if(conn->incoming.size() < 4) return false;
+// The handling is split into try_one_request(). If there is not enough data, it will do nothing until a future loop iteration with more data.
+// TCP is a byte stream, so a single read() may contain a partial request
+// or multiple requests. We first accumulate bytes into the input buffer,
+// then try to parse complete requests. If a request is incomplete, we
+// return and wait for the next poll() event instead of blocking.
+static void try_parse_request(Conn* conn){
+    if(conn->incoming.size() < 4) return;
 
     uint32_t len = 0;
     memcpy(&len, conn->incoming.data(), 4);
     if(len > MAX_BUF_SIZE) {
         conn->want_close = true;
-        return false;
+        return;
     }
 
-    if(4 + len > conn->incoming.size()) return false; // -> want_read
+    if(4 + len > conn->incoming.size()) return;
 
     const uint8_t* request = &conn->incoming[4];
 
-    // 4. process message
-
-    // generate response (we're echoing rn)
-    buf_append(conn->outgoing, (const uint8_t *)&len, 4);
+    /* PROCESS REQUEST */
+    buf_append(conn->outgoing, (const uint8_t*)&len, 4);
     buf_append(conn->outgoing, request, len);
 
-    // remove message from Conn::incoming
+    // remove the message from incoming
     buf_consume(conn->incoming, len + 4);
-
-    return true;
 }
 
 static void handle_read(Conn* conn) {
-    // 1. do non blocking read
+    // non blocking read
     uint8_t buf[MAX_BUF_SIZE];
-    ssize_t rv = read(conn->fd, buf, MAX_BUF_SIZE);
-    std::cout << "byets read: " << rv << '\n';
-    if(rv <= 0) {
+    ssize_t count = read(conn->fd, buf, sizeof(buf));
+    if(count <= 0) {
         conn->want_close = true;
         return;
     }
-    buf[rv] = '\0';
 
-    // 2. append data to incoming buffer
-    buf_append(conn->incoming, buf, rv);
-    // 3. try to parse buffer
-    // 4. process parsed message
-    // 5. remove message from Conn::incoming
-    try_one_request(conn);
+    // whatever data the client sends, we don't care just consume it
+    buf_append(conn->incoming, buf, (size_t)count);
 
-    if(conn->outgoing.size() > 0){ // has a response
+    try_parse_request(conn);
+
+    if(conn->outgoing.size() > 0) {
         conn->want_write = true;
-        conn->want_read = false;
-    } // else: want_read
+        conn->want_read  = false;
+    }
 }
 
 static void handle_write(Conn* conn) {
     assert(conn->outgoing.size() > 0);
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-    if(rv < 0) {
+    ssize_t count = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if(count < 0) {
         conn->want_close = true;
         return;
     }
 
-    buf_consume(conn->outgoing, (size_t)rv);
-    if(conn->outgoing.size() == 0) { // all data written
+    buf_consume(conn->outgoing,(size_t)count);
+    if(conn->outgoing.size() == 0) {
         conn->want_read = true;
         conn->want_write = false;
-    } // else: want_write = true
+    }
 }
 
 int main() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if(!fd) die("socket()");
+
+    int allow_port_reuse = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &allow_port_reuse, sizeof(allow_port_reuse));
 
     set_fd_nonblock(fd);
-    // allow socket to reuse address after restart
-    int allow_reuse = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &allow_reuse, sizeof(allow_reuse));
 
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(1234); // port: 1234
-    addr.sin_addr.s_addr = htonl(0); // 0.0.0.0
-    int rv = bind(fd, (const struct sockaddr*)&addr, sizeof(addr));
+    addr.sin_port = htons(1234);
+    addr.sin_addr.s_addr = htonl(0);
+    int rv = bind(fd, (const struct sockaddr *)&addr, (socklen_t)(sizeof(addr)));
     if(rv) { die("bind()"); }
 
     rv = listen(fd, SOMAXCONN);
     if(rv) { die("listen()"); }
 
-    // map of all client connections, keyed by fd
-    std::vector<Conn* > fd2conn;
+    std::vector<Conn *> fd2conn;
 
-    /**
-     * struct pollfd {
-     *  int fd;
-     *  short events; // request: read, write, both?
-     *  short revents; // returned: can_read? can_write?
-     * }
-     * int poll(struct pollfd* pfds, nfds_t nfds, int timeout)
-     * nfds -> sizeof pfds array
-     * pollfd::events:
-     *  POLLIN  -> want_read
-     *  POLLOUT -> want_write
-     *  POLLERR -> err
-     * pollfd::revents is returned by poll(). It uses the same set of flags to indicate whether the fd is in the can_read or can_write list.
-     */
     std::vector<struct pollfd> poll_args;
+    /**
+    * struct pollfd {
+    *  int fd;
+    *  short events; // request: read, write, both?
+    *  short revents; // returned: can_read? can_write?
+    * }
+    * int poll(struct pollfd* pfds, nfds_t nfds, int timeout)
+    * nfds -> sizeof pfds array
+    * pollfd::events:
+    *  POLLIN  -> want_readv i.e data is available to read
+    *  POLLOUT -> want_write i.e data is available to write
+    *  POLLERR -> err
+    * basically, instead of being blocked when you call read()/write() we're guarunteed that fd is ready
+    * events: request, revents -> response
+    * pollfd::revents is returned by poll(). It uses the same set of flags to indicate whether the fd is in the can_read or can_write list.
+    * suppose fd = 1, kernel waits for fd, client sends msg "hello" to fd 1, then fd_1.revents = POLLIN i.e i have data to read
+    */
     while(true) {
-        // set up poll arguments
-        // clear list for this iteration
+        // phase 1: setup poll_args for this iteration
         poll_args.clear();
 
-        // put listening socket (server fd) at first position
-        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
-        poll_args.push_back(pfd);
+        // listening socket (the server waiting for new connections)
+        poll_args.push_back(pollfd{ .fd = 0, .events = POLLIN, .revents = 0 });
 
-        for(Conn* c : fd2conn) {
-            if(!c) continue;
+        for(Conn* conn : fd2conn) {
+            if(!conn) continue;
 
-            struct pollfd conn_pfd = { c->fd, POLLERR, 0 };
+            struct pollfd conn_pfd = { .fd = conn->fd, .events = POLLERR, .revents = 0 };
 
-            // poll() flags from the application's intent
-            if(c->want_read) {
+            if(conn->want_read) {
+                // wake me when this fd is readable
                 conn_pfd.events |= POLLIN;
             }
 
-            if(c->want_write) {
+            if(conn->want_write){
                 conn_pfd.events |= POLLOUT;
             }
+
             poll_args.push_back(conn_pfd);
         }
 
@@ -225,8 +224,10 @@ int main() {
         if(rv < 0 && errno == EINTR) continue;
         if(rv < 0) die("poll()");
 
-        // handle the listening socket (server fd)
-        if(poll_args[0].revents) {
+        // phase 2: listen on the first socket
+        if(poll_args[0].revents & POLLIN){
+            printf("accepting connection\n");
+            printf("current poll_args size: %zu\n", poll_args.size());
             if(Conn* conn = handle_accept(fd)) {
                 if(fd2conn.size() <= (size_t)conn->fd) {
                     fd2conn.resize(conn->fd + 1);
@@ -235,23 +236,21 @@ int main() {
             }
         }
 
-        for(size_t i = 1; i < poll_args.size(); i++) {
-            uint32_t ready = poll_args[i].revents;
-            Conn* conn = fd2conn[poll_args[i].fd];
-            if(ready & POLLIN) {
-                handle_read(conn); // application logic
+        for(size_t i = 1; i < poll_args.size(); ++i) {
+            Conn* conn      = fd2conn[poll_args[i].fd];
+            uint32_t ready  = poll_args[i].revents;
+            if(ready & POLLIN){
+                handle_read(conn);
             } else if (ready & POLLOUT) {
-               handle_write(conn); // application logic
+                handle_write(conn);
             }
 
-            if ((ready & POLLERR) || conn->want_close) {
+            if((ready & POLLERR) || conn->want_close) {
                 close(conn->fd);
                 fd2conn[conn->fd] = NULL;
                 delete conn;
             }
         }
-
-
     }
 
 }
