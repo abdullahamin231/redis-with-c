@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <vector>
 #include <poll.h>
+#include <map>
 
 #define MAX_BUF_SIZE 64 * 1024
 #define MAX_ARGS 8
@@ -25,6 +26,12 @@
 struct Conn;
 void handle_read(Conn* conn);
 void handle_write(Conn* conn);
+
+static std::map<std::string, std::string> global_map_replace;
+struct Response {
+    uint32_t status = 0;
+    std::vector<uint8_t> data;
+};
 
 void die(const char* err_str) {
     fprintf(stderr, "%s\n", err_str);
@@ -173,6 +180,30 @@ static bool try_parse_request(Conn* conn){
     printf("cmd: ");
     for(const auto& cmd : cmds) printf("%s ", cmd.c_str());
     printf("\n");
+    Response response;
+    const auto execute_cmd = [&]() {
+        if(cmds.size() == 2 && cmds[0] == "GET") {
+            auto it = global_map_replace.find(cmds[1]);
+            if(it == global_map_replace.end()) {
+                response.status = -1;
+                return;
+            }
+            const std::string& val = it->second;
+            response.data.assign(val.begin(), val.end());
+        } else if (cmds.size() == 3 && cmds[0] == "SET") {
+            global_map_replace[cmds[1]].swap(cmds[2]);
+        } else if (cmds.size() == 2 && cmds[0] == "DEL") {
+            global_map_replace.erase(cmds[1]);
+        } else {
+            response.status = -1;
+        }
+    };
+    execute_cmd();
+
+    uint32_t resp_len = 4 + (uint32_t)response.data.size();
+    buf_append(conn->outgoing, (const uint8_t *)&resp_len, 4);
+    buf_append(conn->outgoing, (const uint8_t *)&response.status, 4);
+    buf_append(conn->outgoing, response.data.data(), response.data.size());
 
 
     // remove the message from incoming
