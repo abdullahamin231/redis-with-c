@@ -99,17 +99,17 @@ static Conn* handle_accept(int fd) {
 // or multiple requests. We first accumulate bytes into the input buffer,
 // then try to parse complete requests. If a request is incomplete, we
 // return and wait for the next poll() event instead of blocking.
-static void try_parse_request(Conn* conn){
-    if(conn->incoming.size() < 4) return;
+static bool try_parse_request(Conn* conn){
+    if(conn->incoming.size() < 4) return false;
 
     uint32_t len = 0;
     memcpy(&len, conn->incoming.data(), 4);
     if(len > MAX_BUF_SIZE) {
         conn->want_close = true;
-        return;
+        return false;
     }
 
-    if(4 + len > conn->incoming.size()) return;
+    if(4 + len > conn->incoming.size()) return false;
 
     const uint8_t* request = &conn->incoming[4];
 
@@ -119,6 +119,8 @@ static void try_parse_request(Conn* conn){
 
     // remove the message from incoming
     buf_consume(conn->incoming, len + 4);
+
+    return true;
 }
 
 static void handle_read(Conn* conn) {
@@ -133,7 +135,10 @@ static void handle_read(Conn* conn) {
     // whatever data the client sends, we don't care just consume it
     buf_append(conn->incoming, buf, (size_t)count);
 
-    try_parse_request(conn);
+    //keep parsing requests until we can't anymore
+    // [len][request][len][request]...in case client sends multiple requests at once
+    // one read() can have more than 1 request
+    while(try_parse_request(conn)) {}
 
     if(conn->outgoing.size() > 0) {
         conn->want_write = true;
@@ -200,7 +205,7 @@ int main() {
         poll_args.clear();
 
         // listening socket (the server waiting for new connections)
-        poll_args.push_back(pollfd{ .fd = 0, .events = POLLIN, .revents = 0 });
+        poll_args.push_back(pollfd{ .fd = fd, .events = POLLIN, .revents = 0 });
 
         for(Conn* conn : fd2conn) {
             if(!conn) continue;
